@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+herhealth.db
+*.db
+.streamlit/secrets.toml
