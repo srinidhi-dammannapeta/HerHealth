@@ -1,6 +1,9 @@
 import sqlite3
 import io
 import zipfile
+import hashlib
+import hmac
+import secrets
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -190,34 +193,13 @@ footer {
 
 
 # -------------------------------
-# Sidebar navigation
-# -------------------------------
-st.sidebar.title("🌸 HerHealth")
-st.sidebar.write("Women's Health Platform")
-
-page = st.sidebar.radio(
-    "Navigate",
-    [
-        "Home",
-        "Symptom Tracking",
-        "Health Dashboard",
-        "Cycle Tracker",
-        "Health Awareness",
-        "Health Reminders",
-        "Health Summary Report",
-        "Symptom Calendar",
-        "Symptom Trend Comparison",
-        "Complete Health Report"
-    ]
-)
-
-# -------------------------------
 # Database configuration
 # -------------------------------
 DB_PATH = Path(__file__).resolve().parent / "herhealth.db"
 
 
 def initialize_database():
+    """Create tables and safely add account ownership to existing records."""
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS symptoms (
@@ -228,14 +210,12 @@ def initialize_database():
                 notes TEXT
             )
         """)
-
         connection.execute("""
             CREATE TABLE IF NOT EXISTS cycle_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 start_date TEXT NOT NULL UNIQUE
             )
         """)
-
         connection.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,108 +227,283 @@ def initialize_database():
                 active INTEGER NOT NULL DEFAULT 1
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-        # Add status to an existing reminders table if needed.
-        reminder_columns = pd.read_sql_query(
-            "PRAGMA table_info(reminders)",
-            connection
-        )["name"].tolist()
+        for table in ("symptoms", "cycle_records", "reminders"):
+            columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "user_id" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
 
+        reminder_columns = [row[1] for row in connection.execute("PRAGMA table_info(reminders)").fetchall()]
         if "status" not in reminder_columns:
+            connection.execute("ALTER TABLE reminders ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'")
+
+        # Older versions made start_date globally unique. Rebuild the table so
+        # two separate accounts may legitimately record the same calendar date.
+        indexes = connection.execute("PRAGMA index_list(cycle_records)").fetchall()
+        globally_unique_date = False
+        for index in indexes:
+            if index[2]:
+                index_name = index[1].replace('"', '""')
+                index_columns = [row[2] for row in connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()]
+                if index_columns == ["start_date"]:
+                    globally_unique_date = True
+                    break
+        if globally_unique_date:
             connection.execute("""
-                ALTER TABLE reminders
-                ADD COLUMN status TEXT NOT NULL DEFAULT 'Pending'
+                CREATE TABLE cycle_records_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_date TEXT NOT NULL,
+                    user_id INTEGER,
+                    UNIQUE(user_id, start_date)
+                )
             """)
+            connection.execute("""
+                INSERT OR IGNORE INTO cycle_records_new (id, start_date, user_id)
+                SELECT id, start_date, user_id FROM cycle_records
+            """)
+            connection.execute("DROP TABLE cycle_records")
+            connection.execute("ALTER TABLE cycle_records_new RENAME TO cycle_records")
 
 
 # -------------------------------
-# Symptom database functions
+# Password and account functions
 # -------------------------------
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_bytes(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200_000
+    )
+
+    return salt.hex(), password_hash.hex()
+
+
+def verify_password(password, stored_salt, stored_hash):
+    salt = bytes.fromhex(stored_salt)
+    _, password_hash = hash_password(password, salt)
+
+    return hmac.compare_digest(password_hash, stored_hash)
+
+
+def register_user(email, password):
+    email = email.strip().lower()
+
+    salt, password_hash = hash_password(password)
+
+    try:
+        with sqlite3.connect(DB_PATH) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO users (email, password_hash)
+                VALUES (?, ?)
+                """,
+                (email, f"{salt}:{password_hash}")
+            )
+            new_user_id = int(cursor.lastrowid)
+            user_count = connection.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+
+            # Preserve records from the original single-user version by
+            # assigning unowned legacy records to the very first account only.
+            # Later accounts never receive another account's records.
+            if user_count == 1:
+                for table in ("symptoms", "cycle_records", "reminders"):
+                    connection.execute(
+                        f"UPDATE {table} SET user_id = ? WHERE user_id IS NULL",
+                        (new_user_id,)
+                    )
+        return True, "Account created successfully."
+
+    except sqlite3.IntegrityError:
+        return False, "An account with this email already exists."
+
+
+def authenticate_user(email, password):
+    email = email.strip().lower()
+
+    with sqlite3.connect(DB_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT id, password_hash
+            FROM users
+            WHERE email = ?
+            """,
+            (email,)
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    user_id, stored_password = row
+
+    try:
+        salt, password_hash = stored_password.split(":", 1)
+    except ValueError:
+        return None
+
+    if verify_password(password, salt, password_hash):
+        return user_id
+
+    return None
+
+
+# -------------------------------
+# User-scoped database functions
+# -------------------------------
+def current_user_id():
+    return int(st.session_state["user_id"])
+
+
 def save_symptom(symptom, date, severity, notes):
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
-            """
-            INSERT INTO symptoms (symptom, date, severity, notes)
-            VALUES (?, ?, ?, ?)
-            """,
-            (symptom, str(date), severity, notes)
+            """INSERT INTO symptoms (symptom, date, severity, notes, user_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (symptom, str(date), severity, notes, current_user_id())
         )
 
 
 def get_symptoms():
     with sqlite3.connect(DB_PATH) as connection:
         return pd.read_sql_query(
-            """
-            SELECT id, symptom, date, severity, notes
-            FROM symptoms
-            ORDER BY date DESC, id DESC
-            """,
-            connection
+            """SELECT id, symptom, date, severity, notes
+               FROM symptoms WHERE user_id = ?
+               ORDER BY date DESC, id DESC""",
+            connection, params=(current_user_id(),)
         )
 
 
-# -------------------------------
-# Cycle database functions
-# -------------------------------
 def save_cycle_start(start_date):
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
-            "INSERT OR IGNORE INTO cycle_records (start_date) VALUES (?)",
-            (str(start_date),)
+            """INSERT OR IGNORE INTO cycle_records (start_date, user_id)
+               VALUES (?, ?)""",
+            (str(start_date), current_user_id())
         )
 
 
 def get_cycle_history():
     with sqlite3.connect(DB_PATH) as connection:
         return pd.read_sql_query(
-            """
-            SELECT id, start_date
-            FROM cycle_records
-            ORDER BY start_date DESC, id DESC
-            """,
-            connection
+            """SELECT id, start_date FROM cycle_records
+               WHERE user_id = ? ORDER BY start_date DESC, id DESC""",
+            connection, params=(current_user_id(),)
         )
 
 
-# -------------------------------
-# Reminder database functions
-# -------------------------------
-def save_reminder(reminder_type, title, reminder_date,
-                  reminder_time, notes):
+def save_reminder(reminder_type, title, reminder_date, reminder_time, notes):
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
-            """
-            INSERT INTO reminders
-            (reminder_type, title, reminder_date,
-             reminder_time, notes, active, status)
-            VALUES (?, ?, ?, ?, ?, 1, 'Pending')
-            """,
-            (
-                reminder_type,
-                title,
-                str(reminder_date),
-                str(reminder_time),
-                notes
-            )
+            """INSERT INTO reminders
+               (reminder_type, title, reminder_date, reminder_time,
+                notes, active, status, user_id)
+               VALUES (?, ?, ?, ?, ?, 1, 'Pending', ?)""",
+            (reminder_type, title, str(reminder_date), str(reminder_time),
+             notes, current_user_id())
         )
 
 
 def get_reminders():
     with sqlite3.connect(DB_PATH) as connection:
         return pd.read_sql_query(
-            """
-            SELECT id, reminder_type, title,
-                   reminder_date, reminder_time,
-                   notes, active, status
-            FROM reminders
-            ORDER BY reminder_date ASC, reminder_time ASC
-            """,
-            connection
+            """SELECT id, reminder_type, title, reminder_date,
+                      reminder_time, notes, active, status
+               FROM reminders WHERE user_id = ?
+               ORDER BY reminder_date ASC, reminder_time ASC""",
+            connection, params=(current_user_id(),)
         )
 
-
-# Initialize database before displaying pages.
+# Initialize the database before displaying authentication or app pages.
 initialize_database()
+
+if "user_id" not in st.session_state:
+    st.session_state["user_id"] = None
+if "user_email" not in st.session_state:
+    st.session_state["user_email"] = None
+
+if st.session_state["user_id"] is None:
+    st.title("🌸 Welcome to HerHealth")
+    st.subheader("Women's Health Monitoring & Awareness")
+    st.write("Create an account or sign in to manage your own health records.")
+    login_tab, register_tab = st.tabs(["Login", "Create Account"])
+
+    with login_tab:
+        with st.form("login_form"):
+            login_email = st.text_input("Email address", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            login_submit = st.form_submit_button("Login", use_container_width=True)
+        if login_submit:
+            if not login_email.strip() or not login_password:
+                st.error("Enter your email address and password.")
+            else:
+                authenticated_id = authenticate_user(login_email, login_password)
+                if authenticated_id is None:
+                    st.error("Email or password is incorrect.")
+                else:
+                    st.session_state["user_id"] = int(authenticated_id)
+                    st.session_state["user_email"] = login_email.strip().lower()
+                    st.rerun()
+
+    with register_tab:
+        with st.form("register_form"):
+            register_email = st.text_input("Email address", key="register_email")
+            register_password = st.text_input("Create password (at least 8 characters)", type="password", key="register_password")
+            confirm_password = st.text_input("Confirm password", type="password", key="confirm_password")
+            register_submit = st.form_submit_button("Create Account", use_container_width=True)
+        if register_submit:
+            email_value = register_email.strip().lower()
+            if "@" not in email_value or "." not in email_value.rsplit("@", 1)[-1]:
+                st.error("Enter a valid email address.")
+            elif len(register_password) < 8:
+                st.error("Your password must contain at least 8 characters.")
+            elif register_password != confirm_password:
+                st.error("The passwords do not match.")
+            else:
+                success, message = register_user(email_value, register_password)
+                if success:
+                    authenticated_id = authenticate_user(email_value, register_password)
+                    st.session_state["user_id"] = int(authenticated_id)
+                    st.session_state["user_email"] = email_value
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+    st.info("If this is the first account created in this local app, existing records from the earlier single-user version will be linked to it. Later accounts remain separate.")
+    st.stop()
+
+# Sidebar navigation is shown only after successful login.
+st.sidebar.title("🌸 HerHealth")
+st.sidebar.write("Women's Health Platform")
+st.sidebar.caption(f"Signed in as {st.session_state['user_email']}")
+if st.sidebar.button("Log Out", use_container_width=True):
+    st.session_state["user_id"] = None
+    st.session_state["user_email"] = None
+    st.rerun()
+
+page = st.sidebar.radio(
+    "Navigate",
+    [
+        "Home", "Symptom Tracking", "Health Dashboard", "Cycle Tracker",
+        "Health Awareness", "Health Reminders", "Health Summary Report",
+        "Symptom Calendar", "Symptom Trend Comparison", "Complete Health Report"
+    ]
+)
+
 history = get_symptoms()
 
 # -------------------------------
@@ -1166,8 +1321,8 @@ elif page == "Health Reminders":
             due_ids = reminders.loc[due_mask, "id"].astype(int).tolist()
             with sqlite3.connect(DB_PATH) as connection:
                 connection.executemany(
-                    "UPDATE reminders SET status = 'Due' WHERE id = ?",
-                    [(reminder_id,) for reminder_id in due_ids]
+                    "UPDATE reminders SET status = 'Due' WHERE id = ? AND user_id = ?",
+                    [(reminder_id, current_user_id()) for reminder_id in due_ids]
                 )
             reminders.loc[due_mask, "status"] = "Due"
 
@@ -1230,18 +1385,18 @@ elif page == "Health Reminders":
                             """
                             UPDATE reminders
                             SET status = 'Completed', active = 0
-                            WHERE id = ?
+                            WHERE id = ? AND user_id = ?
                             """,
-                            (int(selected_id),)
+                            (int(selected_id), current_user_id())
                         )
                     else:
                         connection.execute(
                             """
                             UPDATE reminders
                             SET active = 0
-                            WHERE id = ?
+                            WHERE id = ? AND user_id = ?
                             """,
-                            (int(selected_id),)
+                            (int(selected_id), current_user_id())
                         )
 
                 st.success("Reminder updated successfully.")
@@ -1300,8 +1455,8 @@ elif page == "Health Reminders":
                     else:
                         with sqlite3.connect(DB_PATH) as connection:
                             connection.execute(
-                                "UPDATE reminders SET title = ? WHERE id = ?",
-                                (new_title.strip(), int(edit_id))
+                                "UPDATE reminders SET title = ? WHERE id = ? AND user_id = ?",
+                                (new_title.strip(), int(edit_id), current_user_id())
                             )
 
                         st.success("Reminder title updated successfully!")
@@ -1891,6 +2046,27 @@ elif page == "Complete Health Report":
             & (reminders_report["reminder_date"] <= report_end_date)
         ]
 
+
+    # Recalculate summary values using the selected date range.
+    severe_count_filtered = 0
+    if not symptoms_report.empty:
+        severe_count_filtered = int(
+            symptoms_report["severity"].astype(str).str.lower().eq("severe").sum()
+        )
+    completed_count_filtered = 0
+    if not reminders_report.empty:
+        completed_count_filtered = int(
+            reminders_report["status"].astype(str).str.lower().eq("completed").sum()
+        )
+    summary_report = pd.DataFrame(
+        [
+            ["Total symptom records", len(symptoms_report)],
+            ["Severe symptom records", severe_count_filtered],
+            ["Period start dates recorded", len(cycles_report)],
+            ["Total reminders", len(reminders_report)],
+            ["Completed reminders", completed_count_filtered],
+        ], columns=["Metric", "Value"]
+    )
 
     st.subheader("Health Summary")
     col1, col2, col3 = st.columns(3)
